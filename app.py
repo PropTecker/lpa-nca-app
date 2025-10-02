@@ -152,7 +152,7 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 # --------------------------------
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
-    st.image("logo.png", width=120)
+    st.image("wild_capital_uk_logo.png", width=120)
 
 st.title("UK LPA & NCA Lookup")
 st.caption("Enter a **postcode** or a **free-text address**. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.")
