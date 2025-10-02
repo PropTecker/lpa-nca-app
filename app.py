@@ -5,30 +5,44 @@ import streamlit as st
 from typing import Optional, Tuple, Dict, Any, List
 from streamlit_folium import st_folium
 import folium
+import base64
+from pathlib import Path
 
 # -------------------------------
 # Page config with logo as favicon
 # -------------------------------
 st.set_page_config(
     page_title="UK LPA & NCA Lookup",
-    page_icon="wild_capital_uk_logo.png",
+    page_icon="wild_capital_uk_logo.png",  # still used for browser tab
     layout="centered"
 )
 
-# --------------------------------
+# -------------------------------
+# Helper: embed logo inline
+# -------------------------------
+def inline_logo_b64(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return ""
+    data = p.read_bytes()
+    b64 = base64.b64encode(data).decode("utf-8")
+    # adjust MIME type if SVG
+    return f"data:image/png;base64,{b64}"
+
+# -------------------------------
 # Endpoints & utilities
-# --------------------------------
+# -------------------------------
 POSTCODES_IO = "https://api.postcodes.io/postcodes/"
 POSTCODES_IO_REVERSE = "https://api.postcodes.io/postcodes"
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
-# Natural England — National Character Areas (polygon layer 0)
+# Natural England — National Character Areas
 NCA_FEATURESERVER_LAYER = (
     "https://services.arcgis.com/JJzESW51TqeY9uat/arcgis/rest/services/"
     "National_Character_Areas_England/FeatureServer/0"
 )
 
-# ONS — Local Authority Districts (December 2024) Boundaries UK (BFC), polygon layer 0
+# ONS — Local Authority Districts (December 2024)
 LPA_FEATURESERVER_LAYER = (
     "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
     "Local_Authority_Districts_December_2024_Boundaries_UK_BFC/FeatureServer/0"
@@ -39,12 +53,11 @@ POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", fla
 def looks_like_uk_postcode(s: str) -> bool:
     return bool(POSTCODE_RX.match((s or "").strip()))
 
-# --------------------------------
+# -------------------------------
 # Cached API wrappers
-# --------------------------------
+# -------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
-    """Return (lat, lon, lpa, normalised_postcode); raises RuntimeError on failure."""
     pc = postcode.replace(" ", "").upper()
     r = requests.get(POSTCODES_IO + pc, timeout=10)
     if r.status_code != 200:
@@ -53,7 +66,6 @@ def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
         except Exception:
             err = ""
         raise RuntimeError(f"Postcode error ({r.status_code}): {err or 'unknown error'}")
-
     data = r.json().get("result") or {}
     lat = data.get("latitude")
     lon = data.get("longitude")
@@ -64,7 +76,6 @@ def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def geocode_address_nominatim(address: str) -> Tuple[float, float]:
-    """Return (lat, lon) using Nominatim; raises RuntimeError on failure."""
     params = {"q": address, "format": "jsonv2", "limit": 1, "addressdetails": 0}
     headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (contact: your.email@company.com)"}
     r = requests.get(NOMINATIM_SEARCH, params=params, headers=headers, timeout=15)
@@ -81,7 +92,6 @@ def geocode_address_nominatim(address: str) -> Tuple[float, float]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Optional[str], str]:
-    """Return (nearest_postcode, lpa)."""
     params = {"lon": lon, "lat": lat, "limit": 1}
     r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=10)
     if r.status_code != 200:
@@ -95,7 +105,6 @@ def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Option
     return res.get("postcode"), lpa
 
 def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields: str) -> Dict[str, Any]:
-    """Query an ArcGIS FeatureServer polygon layer with a WGS84 point; return first feature (attrs+geometry) or {}."""
     geometry_dict = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
     params = {
         "f": "json",
@@ -119,7 +128,6 @@ def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields:
     return feats[0] if feats else {}
 
 def _arcgis_polygon_to_geojson(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Convert ArcGIS polygon geometry (rings) to a GeoJSON-like dict for Folium."""
     if not geom or "rings" not in geom:
         return None
     rings = geom["rings"]
@@ -146,15 +154,17 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     a = (feat or {}).get("attributes") or {}
     return a.get("LAD24NM") or a.get("NAME")
 
-# --------------------------------
-# Header (centered logo + title + subtitle)
-# --------------------------------
+# -------------------------------
+# Header with inline logo + title
+# -------------------------------
+logo_src = inline_logo_b64("wild_capital_uk_logo.png")
+
 st.markdown(
-    """
+    f"""
     <div style="text-align: center;">
-        <img src="wild_capital_uk_logo.png" width="180" style="margin-bottom: 0.5em;">
-        <h1 style="margin-top: 0.2em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
-        <p style="font-size: 1.1em; color: #555; margin-top: 0;">
+        {'<img src="'+logo_src+'" width="180" style="margin-bottom:0.5em;">' if logo_src else ''}
+        <h1 style="margin-top:0.2em;margin-bottom:0.25em;">UK LPA & NCA Lookup</h1>
+        <p style="font-size:1.1em;color:#555;margin-top:0;">
             Enter a postcode or a free-text address. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.
         </p>
     </div>
@@ -162,9 +172,9 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# --------------------------------
-# CSS for wrap-friendly result boxes
-# --------------------------------
+# -------------------------------
+# CSS for result boxes
+# -------------------------------
 st.markdown("""
 <style>
 .result-grid {display: grid; grid-template-columns: 1fr; gap: 0.75rem;}
@@ -183,17 +193,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --------------------------------
+# -------------------------------
 # Input form
-# --------------------------------
+# -------------------------------
 with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
     submitted = st.form_submit_button("Lookup")
 
-# --------------------------------
+# -------------------------------
 # Processing & Results
-# --------------------------------
+# -------------------------------
 if submitted:
     notes: List[str] = []
     try:
@@ -319,3 +329,4 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
