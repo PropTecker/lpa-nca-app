@@ -296,7 +296,7 @@ with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
 
-    with st.expander('💧 Optional: Water body catchment overlays <span class="badge-new">NEW</span>', expanded=False):
+    with st.expander('Water body catchment overlays 🆕', expanded=False):
         # Water body catchment (NEW)
         c1, c2 = st.columns([0.08, 0.92])
         with c1:
