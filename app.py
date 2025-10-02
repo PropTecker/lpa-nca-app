@@ -152,7 +152,7 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 st.markdown(
     """
     <div style="text-align: center;">
-        <img src="wild_capital_uk_logo.png" width="160">
+        <img src="wild_capital_uk_logo.png" width="120">
         <h1 style="margin-top: 0.5em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
         <p style="font-size: 1.1em; color: #555;">
             Enter a postcode or a free-text address. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.
