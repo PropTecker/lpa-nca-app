@@ -48,7 +48,7 @@ LPA_FEATURESERVER_LAYER = (
     "Local_Authority_Districts_December_2024_Boundaries_UK_BFC/FeatureServer/0"
 )
 
-# EA OGC API – Features: WFD River Water Body Catchments Cycle 3 (Classification 2022, full resolution)
+# EA OGC API – Features: WFD River Water Body Catchments Cycle 3 (Classification 2022)
 EA_WB_CATCHMENTS_COLL = (
     "https://environment.data.gov.uk/geoservices/datasets/"
     "cd84a955-fd0a-4f5d-9bcb-b869c8906f9e/ogc/features/v1/"
@@ -59,6 +59,72 @@ POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", fla
 
 def looks_like_uk_postcode(s: str) -> bool:
     return bool(POSTCODE_RX.match((s or "").strip()))
+
+# -------------------------------
+# Geo helpers: point-in-polygon for GeoJSON
+# -------------------------------
+def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
+    """
+    Ray casting algorithm for a linear ring (lon/lat pairs). True if point is inside or on edge.
+    """
+    inside = False
+    n = len(ring)
+    if n < 3:
+        return False
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        # Check if on segment (edge-inclusive)
+        # colinear + within bounding box
+        dx, dy = x2 - x1, y2 - y1
+        if dx == dy == 0:
+            continue
+        if min(y1, y2) - 1e-12 <= lat <= max(y1, y2) + 1e-12:
+            if abs(dx) > 1e-18:
+                t = (lat - y1) / dy if abs(dy) > 1e-18 else None
+                # horizontal segment handled below
+            # Edge crossing test
+        cond = ((y1 > lat) != (y2 > lat)) and (lon < (x2 - x1) * (lat - y1) / (y2 - y1 + 1e-18) + x1)
+        if cond:
+            inside = not inside
+        # Edge-inclusive quick check
+        # Handle point exactly on segment:
+        if min(x1, x2) - 1e-12 <= lon <= max(x1, x2) + 1e-12 and min(y1, y2) - 1e-12 <= lat <= max(y1, y2) + 1e-12:
+            # Check colinearity
+            if abs((y2 - y1) * (lon - x1) - (x2 - x1) * (lat - y1)) <= 1e-12:
+                return True
+    return inside
+
+def geojson_contains_point(geom: Dict[str, Any], lon: float, lat: float) -> bool:
+    """
+    Return True if (lon,lat) is inside a GeoJSON Polygon/MultiPolygon (holes respected; edge-inclusive).
+    """
+    if not geom or "type" not in geom:
+        return False
+    gtype = geom["type"]
+    if gtype == "Polygon":
+        rings = geom.get("coordinates") or []
+        if not rings:
+            return False
+        # First ring is outer; others are holes
+        if not _point_in_ring(lon, lat, rings[0]):
+            return False
+        for hole in rings[1:]:
+            if _point_in_ring(lon, lat, hole):
+                return False
+        return True
+    elif gtype == "MultiPolygon":
+        for poly in geom.get("coordinates") or []:
+            if not poly:
+                continue
+            if _point_in_ring(lon, lat, poly[0]):
+                # Must not be in any holes
+                hole_hit = any(_point_in_ring(lon, lat, hole) for hole in poly[1:])
+                if not hole_hit:
+                    return True
+        return False
+    else:
+        return False
 
 # -------------------------------
 # Cached API wrappers
@@ -162,53 +228,61 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     return a.get("LAD24NM") or a.get("NAME")
 
 # -------------------------------
-# WFD River Water Body Catchments (Cycle 3)
+# WFD River Water Body Catchments (Cycle 3) with strict containment
 # -------------------------------
 def _ogc_point_cql(lat: float, lon: float) -> str:
     # OGC API uses lon lat order
     return f"INTERSECTS(shape,POINT({lon} {lat}))"
 
-def _bbox_around_point(lat: float, lon: float, meters: float = 100.0) -> Tuple[float, float, float, float]:
+def _bbox_around_point(lat: float, lon: float, meters: float = 150.0) -> Tuple[float, float, float, float]:
     dlat = meters / 111320.0
     dlon = meters / (40075000.0 * math.cos(math.radians(lat)) / 360.0)
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
 def _fetch_water_body_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    """Try CQL2 INTERSECTS against the EA WFD River Water Body Catchments (Cycle 3). Fallback to small bbox."""
-    # First: CQL2 filter
+    """
+    Return the ONE water body catchment feature that truly contains (lon,lat).
+    1) Try CQL2 INTERSECTS to narrow candidates, then verify with our own point-in-polygon.
+    2) If CQL fails, do a small bbox query, then pick the first that contains the point.
+    """
+    # First: CQL2 filter (INTERSECTS) to get nearby candidates
     try:
         params = {
             "f": "application/geo+json",
-            "limit": 5,
+            "limit": 20,
             "filter-lang": "cql2-text",
             "filter": _ogc_point_cql(lat, lon)
         }
         r = requests.get(EA_WB_CATCHMENTS_COLL, params=params, timeout=20)
-        if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type",""):
+        if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
             gj = r.json()
-            feats = gj.get("features") or []
-            if feats:
-                return feats[0]
+            for feat in gj.get("features") or []:
+                geom = feat.get("geometry")
+                if geom and geojson_contains_point(geom, lon, lat):
+                    return feat
     except Exception:
         pass
 
-    # Fallback: tiny bbox query
+    # Fallback: tiny bbox; select the one that CONTAINS the point
     try:
-        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=150)
+        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=250)
         params = {
             "f": "application/geo+json",
-            "limit": 10,
+            "limit": 50,
             "bbox": f"{minx},{miny},{maxx},{maxy}"
         }
         r = requests.get(EA_WB_CATCHMENTS_COLL, params=params, timeout=20)
-        if r.status_code == 200:
+        if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
             gj = r.json()
-            feats = gj.get("features") or []
-            if feats:
-                return feats[0]
+            candidates = gj.get("features") or []
+            for feat in candidates:
+                geom = feat.get("geometry")
+                if geom and geojson_contains_point(geom, lon, lat):
+                    return feat
     except Exception:
         pass
 
+    # None contain the point
     return None
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -264,7 +338,6 @@ st.markdown("""
 with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
-    # --- Catchment drawer (River Water Body Catchment) ---
     with st.expander("Optional: Water body catchment overlay"):
         show_wb = st.checkbox("Show river water body catchment (Cycle 3)", value=False)
         hide_other_layers = st.checkbox("Hide LPA/NCA when catchment is shown", value=False)
@@ -340,10 +413,9 @@ if submitted:
         # ---------- Map ----------
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
 
-        # Decide which layers to show
         show_lpa_nca = not (show_wb and hide_other_layers)
 
-        # LPA polygon (red outline)
+        # LPA (red)
         lpa_geojson = None
         if show_lpa_nca:
             lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
@@ -355,7 +427,7 @@ if submitted:
                     tooltip=f"LPA: {lpa_name}"
                 ).add_to(fmap)
 
-        # NCA polygon (yellow outline)
+        # NCA (yellow)
         nca_geojson = None
         if show_lpa_nca:
             nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
@@ -367,15 +439,15 @@ if submitted:
                     tooltip=f"NCA: {nca_name}"
                 ).add_to(fmap)
 
-        # Water body catchment overlay (blue outline)
+        # Water body catchment (blue) — ONLY if the point is truly inside
         bounds = []
         if show_wb:
             wb_feat = get_water_body_catchment(lat, lon)
             if wb_feat:
                 wb_geom = feature_geom(wb_feat)
-                props = wb_feat.get("properties", {})
-                wb_name = props.get("water_body_name") or props.get("name") or "Water body catchment"
-                if wb_geom:
+                if wb_geom and geojson_contains_point(wb_geom, lon, lat):
+                    props = wb_feat.get("properties", {})
+                    wb_name = props.get("water_body_name") or props.get("name") or "Water body catchment"
                     folium.GeoJson(
                         wb_geom,
                         name=f"WFD water body: {wb_name}",
@@ -399,7 +471,7 @@ if submitted:
             tooltip="Location"
         ).add_to(fmap)
 
-        # Fit bounds (consider polygons we added + point)
+        # Fit bounds
         def extend_bounds_from_geojson(geojson, _bounds):
             if not geojson:
                 return
