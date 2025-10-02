@@ -6,7 +6,14 @@ from typing import Optional, Tuple, Dict, Any, List
 from streamlit_folium import st_folium
 import folium
 
-st.set_page_config(page_title="UK LPA & NCA Lookup", page_icon="🗺️", layout="centered")
+# -------------------------------
+# Page config with logo as icon
+# -------------------------------
+st.set_page_config(
+    page_title="UK LPA & NCA Lookup",
+    page_icon="wild_capital_uk_logo.png",
+    layout="centered"
+)
 
 # --------------------------------
 # Endpoints & utilities
@@ -88,10 +95,7 @@ def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Option
     return res.get("postcode"), lpa
 
 def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields: str) -> Dict[str, Any]:
-    """
-    Query an ArcGIS FeatureServer polygon layer with a WGS84 point; return first feature (attrs+geometry) or {}.
-    Uses explicit /query with JSON-encoded geometry to avoid URL issues.
-    """
+    """Query an ArcGIS FeatureServer polygon layer with a WGS84 point; return first feature (attrs+geometry) or {}."""
     geometry_dict = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
     params = {
         "f": "json",
@@ -115,10 +119,7 @@ def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields:
     return feats[0] if feats else {}
 
 def _arcgis_polygon_to_geojson(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Convert ArcGIS polygon geometry (rings) to a GeoJSON-like dict for Folium.
-    For visualisation: treats each ring as exterior (holes ignored).
-    """
+    """Convert ArcGIS polygon geometry (rings) to a GeoJSON-like dict for Folium."""
     if not geom or "rings" not in geom:
         return None
     rings = geom["rings"]
@@ -135,7 +136,6 @@ def get_nca_feature(lat: float, lon: float) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_lpa_feature(lat: float, lon: float) -> Dict[str, Any]:
-    # ONS 2024 LAD layer uses LAD24NM (name) & LAD24CD (code)
     return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, "LAD24NM,LAD24CD")
 
 def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
@@ -144,20 +144,27 @@ def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 
 def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     a = (feat or {}).get("attributes") or {}
-    # Prefer current field; fall back to older if you ever switch datasets again
-    return a.get("LAD24NM") or a.get("LAD23NM") or a.get("NAME")
+    return a.get("LAD24NM") or a.get("NAME")
 
 # --------------------------------
-# UI (wrapped boxes + full-width map)
+# Header (centered logo + title + subtitle)
 # --------------------------------
-col1, col2, col3 = st.columns([1, 2, 1])
-with col2:
-    st.image("wild_capital_uk_logo.png", width=120)
+st.markdown(
+    """
+    <div style="text-align: center;">
+        <img src="wild_capital_uk_logo.png" width="160">
+        <h1 style="margin-top: 0.5em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
+        <p style="font-size: 1.1em; color: #555;">
+            Enter a postcode or a free-text address. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-st.title("UK LPA & NCA Lookup")
-st.caption("Enter a **postcode** or a **free-text address**. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.")
-
+# --------------------------------
 # CSS for wrap-friendly result boxes
+# --------------------------------
 st.markdown("""
 <style>
 .result-grid {display: grid; grid-template-columns: 1fr; gap: 0.75rem;}
@@ -176,11 +183,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --------------------------------
+# Input form
+# --------------------------------
 with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
     submitted = st.form_submit_button("Lookup")
 
+# --------------------------------
+# Processing & Results
+# --------------------------------
 if submitted:
     notes: List[str] = []
     try:
@@ -210,7 +223,7 @@ if submitted:
             nearest_pc, lpa_text = get_nearest_postcode_lpa_from_coords(lat, lon)
             shown_pc = nearest_pc
 
-        # Fetch polygons (point-in-polygon)
+        # Fetch polygons
         nca_feat = get_nca_feature(lat, lon)
         lpa_feat = get_lpa_feature(lat, lon)
 
@@ -247,56 +260,34 @@ if submitted:
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ---------- Map (bottom, full width) ----------
-        # Build GeoJSONs from ArcGIS geometry for Folium
-        def arcgis_polygon_to_geojson(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not geom or "rings" not in geom:
-                return None
-            rings = geom["rings"]
-            if not rings:
-                return None
-            if len(rings) == 1:
-                return {"type": "Polygon", "coordinates": [rings[0]]}
-            else:
-                return {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+        nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
+        lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
 
-        nca_geojson = arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
-        lpa_geojson = arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
-
-        # Create folium map centered at the point
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
 
-        # Add LPA polygon
+        # Add LPA polygon (red outline)
         if lpa_geojson:
             folium.GeoJson(
                 lpa_geojson,
                 name=f"LPA: {lpa_name}",
-                style_function=lambda x: {
-                    "color": "red",        # outline colour
-                    "fillOpacity": 0.05,
-                    "weight": 2
-                },
+                style_function=lambda x: {"color": "red", "fillOpacity": 0.05, "weight": 2},
                 tooltip=f"LPA: {lpa_name}"
             ).add_to(fmap)
 
-        # Add NCA polygon
+        # Add NCA polygon (yellow outline)
         if nca_geojson:
             folium.GeoJson(
                 nca_geojson,
                 name=f"NCA: {nca_name}",
-                style_function=lambda x: {
-                    "color": "yellow",     # outline colour
-                    "fillOpacity": 0.05,
-                    "weight": 3
-                },
+                style_function=lambda x: {"color": "yellow", "fillOpacity": 0.05, "weight": 3},
                 tooltip=f"NCA: {nca_name}"
             ).add_to(fmap)
 
-        # Add the point marker
+        # Add point marker
         folium.Marker([lat, lon], tooltip="Location").add_to(fmap)
 
-        # Fit bounds to polygons (and always include the point)
+        # Fit bounds
         bounds = []
-
         def extend_bounds(geojson, bounds_list):
             if not geojson:
                 return
@@ -308,9 +299,7 @@ if submitted:
 
         extend_bounds(lpa_geojson, bounds)
         extend_bounds(nca_geojson, bounds)
-        bounds.append([lon, lat])  # ensure the marker is visible
-
-        # Convert to [lat, lon]
+        bounds.append([lon, lat])
         latlon_bounds = [[y, x] for x, y in bounds] if bounds else [[lat, lon], [lat, lon]]
         if latlon_bounds:
             fmap.fit_bounds(latlon_bounds, padding=(20, 20))
@@ -323,5 +312,6 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
