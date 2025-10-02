@@ -48,9 +48,12 @@ LPA_FEATURESERVER_LAYER = (
     "Local_Authority_Districts_December_2024_Boundaries_UK_BFC/FeatureServer/0"
 )
 
-# EA OGC API – Features (Cycle 3) for Water Catchments
-EA_MGMT_COLL = "https://environment.data.gov.uk/geoservices/datasets/1d8bb4fb-35d0-468f-8de8-a72a25aeec2c/ogc/features/v1/collections/WFD_Surface_Water_Management_Catchments_Cycle_3/items"
-EA_OPER_COLL = "https://environment.data.gov.uk/geoservices/datasets/a547e24c-1852-4edb-ab04-bff12ded803e/ogc/features/v1/collections/WFD_Surface_Water_Operational_Catchments_Cycle_3/items"
+# EA OGC API – Features: WFD River Water Body Catchments Cycle 3 (Classification 2022, full resolution)
+EA_WB_CATCHMENTS_COLL = (
+    "https://environment.data.gov.uk/geoservices/datasets/"
+    "cd84a955-fd0a-4f5d-9bcb-b869c8906f9e/ogc/features/v1/"
+    "collections/WFD_River_Water_Body_Catchments_Cycle_3_Classification_2022/items"
+)
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
 
@@ -159,21 +162,20 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     return a.get("LAD24NM") or a.get("NAME")
 
 # -------------------------------
-# Water catchments (EA OGC API)
+# WFD River Water Body Catchments (Cycle 3)
 # -------------------------------
 def _ogc_point_cql(lat: float, lon: float) -> str:
     # OGC API uses lon lat order
     return f"INTERSECTS(shape,POINT({lon} {lat}))"
 
-def _bbox_around_point(lat: float, lon: float, meters: float = 50.0) -> Tuple[float, float, float, float]:
-    # Approx degrees per meter at given latitude
+def _bbox_around_point(lat: float, lon: float, meters: float = 100.0) -> Tuple[float, float, float, float]:
     dlat = meters / 111320.0
     dlon = meters / (40075000.0 * math.cos(math.radians(lat)) / 360.0)
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
-def _fetch_catchment_feature(collection_url: str, lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    """Try CQL2 INTERSECTS first; if unsupported, fall back to small bbox search. Return GeoJSON Feature or None."""
-    # Attempt CQL2
+def _fetch_water_body_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """Try CQL2 INTERSECTS against the EA WFD River Water Body Catchments (Cycle 3). Fallback to small bbox."""
+    # First: CQL2 filter
     try:
         params = {
             "f": "application/geo+json",
@@ -181,8 +183,8 @@ def _fetch_catchment_feature(collection_url: str, lat: float, lon: float) -> Opt
             "filter-lang": "cql2-text",
             "filter": _ogc_point_cql(lat, lon)
         }
-        r = requests.get(collection_url, params=params, timeout=20)
-        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("application/geo+json"):
+        r = requests.get(EA_WB_CATCHMENTS_COLL, params=params, timeout=20)
+        if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type",""):
             gj = r.json()
             feats = gj.get("features") or []
             if feats:
@@ -190,20 +192,19 @@ def _fetch_catchment_feature(collection_url: str, lat: float, lon: float) -> Opt
     except Exception:
         pass
 
-    # Fallback: tiny bbox
+    # Fallback: tiny bbox query
     try:
-        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=100)
+        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=150)
         params = {
             "f": "application/geo+json",
             "limit": 10,
             "bbox": f"{minx},{miny},{maxx},{maxy}"
         }
-        r = requests.get(collection_url, params=params, timeout=20)
+        r = requests.get(EA_WB_CATCHMENTS_COLL, params=params, timeout=20)
         if r.status_code == 200:
             gj = r.json()
             feats = gj.get("features") or []
             if feats:
-                # Return first; (optional) could refine by point-in-polygon without shapely
                 return feats[0]
     except Exception:
         pass
@@ -211,21 +212,13 @@ def _fetch_catchment_feature(collection_url: str, lat: float, lon: float) -> Opt
     return None
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def get_management_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    return _fetch_catchment_feature(EA_MGMT_COLL, lat, lon)
+def get_water_body_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    return _fetch_water_body_catchment(lat, lon)
 
-@st.cache_data(show_spinner=False, ttl=1800)
-def get_operational_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    return _fetch_catchment_feature(EA_OPER_COLL, lat, lon)
-
-def feature_to_simple_geojson(feat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def feature_geom(feat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not feat:
         return None
-    geom = feat.get("geometry")
-    if not geom:
-        return None
-    # Already GeoJSON geometry
-    return geom
+    return feat.get("geometry")
 
 # -------------------------------
 # Header with inline logo + title
@@ -271,15 +264,10 @@ st.markdown("""
 with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
-    # --- Water Catchment drawer ---
-    with st.expander("Optional: Water catchment overlay"):
-        catchment_mode = st.selectbox(
-            "Catchment type",
-            ["None", "Management (Cycle 3)", "Operational (Cycle 3)"],
-            index=0
-        )
-        show_catchment = st.checkbox("Show catchment on the map", value=False)
-        hide_other_layers = st.checkbox("Hide LPA/NCA layers when catchment is shown", value=False)
+    # --- Catchment drawer (River Water Body Catchment) ---
+    with st.expander("Optional: Water body catchment overlay"):
+        show_wb = st.checkbox("Show river water body catchment (Cycle 3)", value=False)
+        hide_other_layers = st.checkbox("Hide LPA/NCA when catchment is shown", value=False)
     submitted = st.form_submit_button("Lookup")
 
 # -------------------------------
@@ -314,7 +302,7 @@ if submitted:
             nearest_pc, lpa_text = get_nearest_postcode_lpa_from_coords(lat, lon)
             shown_pc = nearest_pc
 
-        # Fetch base polygons
+        # Base polygons
         nca_feat = get_nca_feature(lat, lon)
         lpa_feat = get_lpa_feature(lat, lon)
         nca_name = get_nca_name_from_feature(nca_feat) or "Not found"
@@ -353,9 +341,10 @@ if submitted:
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
 
         # Decide which layers to show
-        show_lpa_nca = not (show_catchment and hide_other_layers)
+        show_lpa_nca = not (show_wb and hide_other_layers)
 
         # LPA polygon (red outline)
+        lpa_geojson = None
         if show_lpa_nca:
             lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
             if lpa_geojson:
@@ -367,6 +356,7 @@ if submitted:
                 ).add_to(fmap)
 
         # NCA polygon (yellow outline)
+        nca_geojson = None
         if show_lpa_nca:
             nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
             if nca_geojson:
@@ -377,30 +367,26 @@ if submitted:
                     tooltip=f"NCA: {nca_name}"
                 ).add_to(fmap)
 
-        # Catchment overlay (blue outline)
+        # Water body catchment overlay (blue outline)
         bounds = []
-        if show_catchment and catchment_mode != "None":
-            if catchment_mode.startswith("Management"):
-                c_feat = get_management_catchment(lat, lon)
-            else:
-                c_feat = get_operational_catchment(lat, lon)
-
-            if c_feat:
-                c_geom = feature_to_simple_geojson(c_feat)
-                props = c_feat.get("properties", {})
-                cname = props.get("management_catchment") or props.get("oper_catchment") or props.get("name") or "Catchment"
-                if c_geom:
+        if show_wb:
+            wb_feat = get_water_body_catchment(lat, lon)
+            if wb_feat:
+                wb_geom = feature_geom(wb_feat)
+                props = wb_feat.get("properties", {})
+                wb_name = props.get("water_body_name") or props.get("name") or "Water body catchment"
+                if wb_geom:
                     folium.GeoJson(
-                        c_geom,
-                        name=f"Catchment: {cname}",
+                        wb_geom,
+                        name=f"WFD water body: {wb_name}",
                         style_function=lambda x: {"color": "blue", "fillOpacity": 0.04, "weight": 3},
-                        tooltip=f"Catchment: {cname}"
+                        tooltip=f"WFD water body: {wb_name}"
                     ).add_to(fmap)
                     # extend bounds with catchment
-                    if c_geom["type"] == "Polygon":
-                        bounds.extend(c_geom["coordinates"][0])
-                    elif c_geom["type"] == "MultiPolygon":
-                        for part in c_geom["coordinates"]:
+                    if wb_geom["type"] == "Polygon":
+                        bounds.extend(wb_geom["coordinates"][0])
+                    elif wb_geom["type"] == "MultiPolygon":
+                        for part in wb_geom["coordinates"]:
                             bounds.extend(part[0])
 
         # Red dot marker
@@ -414,7 +400,7 @@ if submitted:
         ).add_to(fmap)
 
         # Fit bounds (consider polygons we added + point)
-        def extend_bounds_from_arcgis_geom(geojson, _bounds):
+        def extend_bounds_from_geojson(geojson, _bounds):
             if not geojson:
                 return
             if geojson["type"] == "Polygon":
@@ -424,14 +410,10 @@ if submitted:
                     _bounds.extend(part[0])
 
         if show_lpa_nca:
-            # add LPA/NCA to bounds if present
-            try:
-                if 'lpa_geojson' in locals() and lpa_geojson:
-                    extend_bounds_from_arcgis_geom(lpa_geojson, bounds)
-                if 'nca_geojson' in locals() and nca_geojson:
-                    extend_bounds_from_arcgis_geom(nca_geojson, bounds)
-            except Exception:
-                pass
+            if lpa_geojson:
+                extend_bounds_from_geojson(lpa_geojson, bounds)
+            if nca_geojson:
+                extend_bounds_from_geojson(nca_geojson, bounds)
 
         bounds.append([lon, lat])
         latlon_bounds = [[y, x] for x, y in bounds] if bounds else [[lat, lon], [lat, lon]]
@@ -446,6 +428,7 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
 
