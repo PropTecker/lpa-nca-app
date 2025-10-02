@@ -60,8 +60,12 @@ EA_WB_CATCHMENTS_COLL = (
     "collections/WFD_River_Water_Body_Catchments_Cycle_3_Classification_2022/items"
 )
 
-# OGC CRS constants
-CRS84 = "http://www.opengis.net/def/crs/OGC/1.3/CRS84"  # lon/lat WGS84
+# CRS forms that different servers accept
+CRS_FORMS = [
+    "http://www.opengis.net/def/crs/OGC/1.3/CRS84",         # CRS:84 (lon/lat)
+    "EPSG:4326",                                            # short
+    "http://www.opengis.net/def/crs/EPSG/0/4326",           # full URI
+]
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
 
@@ -84,7 +88,6 @@ def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
         # Edge-inclusive
         if (min(x1, x2) - 1e-12 <= lon <= max(x1, x2) + 1e-12 and
             min(y1, y2) - 1e-12 <= lat <= max(y1, y2) + 1e-12):
-                # cross product ~ 0
             if abs((y2 - y1) * (lon - x1) - (x2 - x1) * (lat - y1)) <= 1e-12:
                 return True
     return inside
@@ -200,10 +203,12 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     return (feat or {}).get("attributes", {}).get("LAD24NM")
 
 # -------------------------------
-# EA OGC API (full coverage): query helpers
+# OGC helpers (multi-CRS, robust)
 # -------------------------------
-def _ogc_point_cql(lat: float, lon: float) -> str:
-    # lon lat order
+def _ogc_point_cql(lon: float, lat: float, srid_qualified: bool = False) -> str:
+    if srid_qualified:
+        # SRID-qualified WKT (some servers need this form)
+        return f"INTERSECTS(shape,SRID=4326;POINT({lon} {lat}))"
     return f"INTERSECTS(shape,POINT({lon} {lat}))"
 
 def _bbox_around_point(lat: float, lon: float, meters: float = 600.0) -> Tuple[float, float, float, float]:
@@ -211,20 +216,37 @@ def _bbox_around_point(lat: float, lon: float, meters: float = 600.0) -> Tuple[f
     dlon = meters / (40075000.0 * math.cos(math.radians(lat)) / 360.0)
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
-def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float) -> Optional[Dict[str, Any]]:
+def _try_ogc_cql(collection_url: str, lon: float, lat: float) -> Optional[Dict[str, Any]]:
     """
-    Query EA OGC collection for features that intersect the point,
-    then return the one that truly CONTAINS (lon,lat) using strict PIP.
-    IMPORTANT: service stores geometry in EPSG:27700; we explicitly set CRS:84 for filters/bbox.
+    Try several CRS permutations and geometry literals for CQL2 INTERSECTS.
+    Return the first feature whose geometry truly contains (lon,lat).
     """
-    # Try CQL2 INTERSECTS first (with filter-crs=CRS:84)
+    for crs in CRS_FORMS:
+        for srid_geom in (False, True):
+            try:
+                params = {
+                    "f": "application/geo+json",
+                    "limit": 100,
+                    "filter-lang": "cql2-text",
+                    "filter": _ogc_point_cql(lon, lat, srid_qualified=srid_geom),
+                    "filter-crs": crs
+                }
+                r = requests.get(collection_url, params=params, timeout=25)
+                if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
+                    gj = r.json()
+                    for feat in gj.get("features") or []:
+                        geom = feat.get("geometry")
+                        if geom and geojson_contains_point(geom, lon, lat):
+                            return feat
+            except Exception:
+                pass
+    # final attempt: no filter-crs but SRID-qualified geometry in filter
     try:
         params = {
             "f": "application/geo+json",
             "limit": 100,
             "filter-lang": "cql2-text",
-            "filter": _ogc_point_cql(lat, lon),
-            "filter-crs": CRS84
+            "filter": _ogc_point_cql(lon, lat, srid_qualified=True),
         }
         r = requests.get(collection_url, params=params, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
@@ -235,15 +257,33 @@ def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float)
                     return feat
     except Exception:
         pass
+    return None
 
-    # Fallback: small bbox around the point (with bbox-crs=CRS:84)
+def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[str, Any]]:
+    minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=1000)
+    for crs in CRS_FORMS:
+        try:
+            params = {
+                "f": "application/geo+json",
+                "limit": 200,
+                "bbox": f"{minx},{miny},{maxx},{maxy}",
+                "bbox-crs": crs
+            }
+            r = requests.get(collection_url, params=params, timeout=25)
+            if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
+                gj = r.json()
+                for feat in gj.get("features") or []:
+                    geom = feat.get("geometry")
+                    if geom and geojson_contains_point(geom, lon, lat):
+                        return feat
+        except Exception:
+            pass
+    # last resort: bbox without bbox-crs header
     try:
-        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=800)
         params = {
             "f": "application/geo+json",
             "limit": 200,
             "bbox": f"{minx},{miny},{maxx},{maxy}",
-            "bbox-crs": CRS84
         }
         r = requests.get(collection_url, params=params, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
@@ -254,7 +294,17 @@ def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float)
                     return feat
     except Exception:
         pass
+    return None
 
+def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    # IMPORTANT: OGC uses lon/lat order
+    lon_, lat_ = float(lon), float(lat)
+    feat = _try_ogc_cql(collection_url, lon_, lat_)
+    if feat:
+        return feat
+    feat = _try_ogc_bbox(collection_url, lon_, lat_)
+    if feat:
+        return feat
     return None
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -526,6 +576,7 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
 
