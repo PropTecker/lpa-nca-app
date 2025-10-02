@@ -21,10 +21,10 @@ NCA_FEATURESERVER_LAYER = (
     "National_Character_Areas_England/FeatureServer/0"
 )
 
-# ONS — Local Authority Districts Dec 2023 Boundaries (BFC) (polygon layer 0)
+# ONS — Local Authority Districts (December 2024) Boundaries UK (BFC), polygon layer 0
 LPA_FEATURESERVER_LAYER = (
     "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-    "Local_Authority_Districts_December_2023_Boundaries_UK_BFC/FeatureServer/0"
+    "Local_Authority_Districts_December_2024_Boundaries_UK_BFC/FeatureServer/0"
 )
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
@@ -90,7 +90,7 @@ def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Option
 def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields: str) -> Dict[str, Any]:
     """
     Query an ArcGIS FeatureServer polygon layer with a WGS84 point; return first feature (attrs+geometry) or {}.
-    Uses explicit /query with JSON-encoded geometry to avoid 'Invalid URL' issues.
+    Uses explicit /query with JSON-encoded geometry to avoid URL issues.
     """
     geometry_dict = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
     params = {
@@ -135,8 +135,8 @@ def get_nca_feature(lat: float, lon: float) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_lpa_feature(lat: float, lon: float) -> Dict[str, Any]:
-    # ONS 2023 LAD layer commonly uses LAD23NM (name) & LAD23CD (code)
-    return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, "LAD23NM,LAD23CD")
+    # ONS 2024 LAD layer uses LAD24NM (name) & LAD24CD (code)
+    return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, "LAD24NM,LAD24CD")
 
 def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     a = (feat or {}).get("attributes") or {}
@@ -144,8 +144,8 @@ def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 
 def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     a = (feat or {}).get("attributes") or {}
-    # Prefer current field; fall back if needed
-    return a.get("LAD23NM") or a.get("NAME")
+    # Prefer current field; fall back to older if you ever switch datasets again
+    return a.get("LAD24NM") or a.get("LAD23NM") or a.get("NAME")
 
 # --------------------------------
 # UI (wrapped boxes + full-width map)
@@ -244,8 +244,19 @@ if submitted:
 
         # ---------- Map (bottom, full width) ----------
         # Build GeoJSONs from ArcGIS geometry for Folium
-        nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
-        lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
+        def arcgis_polygon_to_geojson(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not geom or "rings" not in geom:
+                return None
+            rings = geom["rings"]
+            if not rings:
+                return None
+            if len(rings) == 1:
+                return {"type": "Polygon", "coordinates": [rings[0]]}
+            else:
+                return {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+
+        nca_geojson = arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
+        lpa_geojson = arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
 
         # Create folium map centered at the point
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
@@ -292,7 +303,6 @@ if submitted:
         if latlon_bounds:
             fmap.fit_bounds(latlon_bounds, padding=(20, 20))
 
-
         st.write("")  # spacer
         st.markdown("### Map")
         st_folium(fmap, height=540, returned_objects=[], use_container_width=True)
@@ -301,4 +311,5 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
