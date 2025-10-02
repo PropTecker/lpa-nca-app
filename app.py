@@ -48,19 +48,20 @@ LPA_FEATURESERVER_LAYER = (
     "Local_Authority_Districts_December_2024_Boundaries_UK_BFC/FeatureServer/0"
 )
 
-# EA OGC API – Features (LATEST, full coverage)
-# Operational Catchments (Cycle 3)
+# EA OGC API – Features (full coverage)
 EA_OPER_COLL = (
     "https://environment.data.gov.uk/geoservices/datasets/"
     "a547e24c-1852-4edb-ab04-bff12ded803e/ogc/features/v1/"
     "collections/WFD_Surface_Water_Operational_Catchments_Cycle_3/items"
 )
-# River Water Body Catchments (Cycle 3, full resolution)
 EA_WB_CATCHMENTS_COLL = (
     "https://environment.data.gov.uk/geoservices/datasets/"
     "cd84a955-fd0a-4f5d-9bcb-b869c8906f9e/ogc/features/v1/"
     "collections/WFD_River_Water_Body_Catchments_Cycle_3_Classification_2022/items"
 )
+
+# OGC CRS constants
+CRS84 = "http://www.opengis.net/def/crs/OGC/1.3/CRS84"  # lon/lat WGS84
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
 
@@ -83,6 +84,7 @@ def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
         # Edge-inclusive
         if (min(x1, x2) - 1e-12 <= lon <= max(x1, x2) + 1e-12 and
             min(y1, y2) - 1e-12 <= lat <= max(y1, y2) + 1e-12):
+                # cross product ~ 0
             if abs((y2 - y1) * (lon - x1) - (x2 - x1) * (lat - y1)) <= 1e-12:
                 return True
     return inside
@@ -204,7 +206,7 @@ def _ogc_point_cql(lat: float, lon: float) -> str:
     # lon lat order
     return f"INTERSECTS(shape,POINT({lon} {lat}))"
 
-def _bbox_around_point(lat: float, lon: float, meters: float = 400.0) -> Tuple[float, float, float, float]:
+def _bbox_around_point(lat: float, lon: float, meters: float = 600.0) -> Tuple[float, float, float, float]:
     dlat = meters / 111320.0
     dlon = meters / (40075000.0 * math.cos(math.radians(lat)) / 360.0)
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
@@ -213,15 +215,16 @@ def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float)
     """
     Query EA OGC collection for features that intersect the point,
     then return the one that truly CONTAINS (lon,lat) using strict PIP.
-    Includes small-bbox fallback to handle intermittent provider filtering quirks.
+    IMPORTANT: service stores geometry in EPSG:27700; we explicitly set CRS:84 for filters/bbox.
     """
-    # Try CQL2 INTERSECTS first
+    # Try CQL2 INTERSECTS first (with filter-crs=CRS:84)
     try:
         params = {
             "f": "application/geo+json",
             "limit": 100,
             "filter-lang": "cql2-text",
-            "filter": _ogc_point_cql(lat, lon)
+            "filter": _ogc_point_cql(lat, lon),
+            "filter-crs": CRS84
         }
         r = requests.get(collection_url, params=params, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
@@ -233,13 +236,14 @@ def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float)
     except Exception:
         pass
 
-    # Fallback: small bbox around the point
+    # Fallback: small bbox around the point (with bbox-crs=CRS:84)
     try:
-        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=600)
+        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=800)
         params = {
             "f": "application/geo+json",
             "limit": 200,
-            "bbox": f"{minx},{miny},{maxx},{maxy}"
+            "bbox": f"{minx},{miny},{maxx},{maxy}",
+            "bbox-crs": CRS84
         }
         r = requests.get(collection_url, params=params, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
@@ -317,7 +321,7 @@ with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
 
-    # NOTE: Streamlit expander labels sanitize HTML; use emoji badge here.
+    # Expander labels sanitize HTML; use emoji badge here.
     with st.expander("💧 Optional: Water body catchment overlays  🆕 NEW", expanded=False):
         # Water body catchment (NEW)
         c1, c2 = st.columns([0.08, 0.92])
@@ -443,16 +447,14 @@ if submitted:
 
         bounds: List[List[float]] = []
 
-        # Water body catchment (blue) — FULL dataset
+        # Water body catchment (blue)
         if show_wb:
             wb_feat = get_water_body_catchment(lat, lon)
             if wb_feat:
                 wb_geom = wb_feat.get("geometry")
                 if wb_geom and geojson_contains_point(wb_geom, lon, lat):
                     props = wb_feat.get("properties", {})
-                    wb_name = (props.get("water_body_name")
-                               or props.get("name")
-                               or "Water body catchment")
+                    wb_name = (props.get("water_body_name") or props.get("name") or "Water body catchment")
                     folium.GeoJson(
                         wb_geom,
                         name=f"WFD water body: {wb_name}",
@@ -465,16 +467,14 @@ if submitted:
                         for part in wb_geom["coordinates"]:
                             bounds.extend(part[0])
 
-        # Operational catchment (purple) — FULL dataset
+        # Operational catchment (purple)
         if show_oper:
             oc_feat = get_operational_catchment(lat, lon)
             if oc_feat:
                 oc_geom = oc_feat.get("geometry")
                 if oc_geom and geojson_contains_point(oc_geom, lon, lat):
                     props = oc_feat.get("properties", {})
-                    oc_name = (props.get("operational_catchment")
-                               or props.get("name")
-                               or "Operational catchment")
+                    oc_name = (props.get("operational_catchment") or props.get("name") or "Operational catchment")
                     folium.GeoJson(
                         oc_geom,
                         name=f"Operational catchment: {oc_name}",
@@ -526,6 +526,7 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
 
