@@ -1,3 +1,4 @@
+import json
 import re
 import requests
 import streamlit as st
@@ -7,25 +8,23 @@ import folium
 
 st.set_page_config(page_title="UK LPA & NCA Lookup", page_icon="🗺️", layout="centered")
 
-# -----------------------------
-# Constants & utilities
-# -----------------------------
+# --------------------------------
+# Endpoints & utilities
+# --------------------------------
 POSTCODES_IO = "https://api.postcodes.io/postcodes/"
 POSTCODES_IO_REVERSE = "https://api.postcodes.io/postcodes"
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
-# Natural England NCA polygons (point-in-polygon)
+# Natural England — National Character Areas (polygon layer 0)
 NCA_FEATURESERVER_LAYER = (
     "https://services.arcgis.com/JJzESW51TqeY9uat/arcgis/rest/services/"
-    "National_Character_Areas_England/FeatureServer/0/query"
+    "National_Character_Areas_England/FeatureServer/0"
 )
 
-# UK Local Authority District (LPA boundary) polygons (ONS):
-# Using 2023 LADs (BFC = full-resolution clipped). Any LAD layer with polygon geometry will work.
-# We’ll do a point-in-polygon (no name matching needed).
+# ONS — Local Authority Districts Dec 2023 Boundaries (BFC) (polygon layer 0)
 LPA_FEATURESERVER_LAYER = (
     "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-    "Local_Authority_Districts_December_2023_UK_BFC/FeatureServer/0/query"
+    "Local_Authority_Districts_December_2023_Boundaries_UK_BFC/FeatureServer/0"
 )
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
@@ -33,11 +32,12 @@ POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", fla
 def looks_like_uk_postcode(s: str) -> bool:
     return bool(POSTCODE_RX.match((s or "").strip()))
 
-# -----------------------------
-# API wrappers (cached)
-# -----------------------------
+# --------------------------------
+# Cached API wrappers
+# --------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
+    """Return (lat, lon, lpa, normalised_postcode); raises RuntimeError on failure."""
     pc = postcode.replace(" ", "").upper()
     r = requests.get(POSTCODES_IO + pc, timeout=10)
     if r.status_code != 200:
@@ -46,6 +46,7 @@ def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
         except Exception:
             err = ""
         raise RuntimeError(f"Postcode error ({r.status_code}): {err or 'unknown error'}")
+
     data = r.json().get("result") or {}
     lat = data.get("latitude")
     lon = data.get("longitude")
@@ -56,8 +57,9 @@ def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def geocode_address_nominatim(address: str) -> Tuple[float, float]:
+    """Return (lat, lon) using Nominatim; raises RuntimeError on failure."""
     params = {"q": address, "format": "jsonv2", "limit": 1, "addressdetails": 0}
-    headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (contact: stuartntis@googlemail.com)"}
+    headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (contact: your.email@company.com)"}
     r = requests.get(NOMINATIM_SEARCH, params=params, headers=headers, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Nominatim error HTTP {r.status_code}")
@@ -72,6 +74,7 @@ def geocode_address_nominatim(address: str) -> Tuple[float, float]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Optional[str], str]:
+    """Return (nearest_postcode, lpa)."""
     params = {"lon": lon, "lat": lat, "limit": 1}
     r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=10)
     if r.status_code != 200:
@@ -87,19 +90,21 @@ def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Option
 def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields: str) -> Dict[str, Any]:
     """
     Query an ArcGIS FeatureServer polygon layer with a WGS84 point; return first feature (attrs+geometry) or {}.
+    Uses explicit /query with JSON-encoded geometry to avoid 'Invalid URL' issues.
     """
-    geometry = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
+    geometry_dict = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
     params = {
         "f": "json",
-        "geometry": str(geometry),
+        "where": "1=1",
+        "geometry": json.dumps(geometry_dict),
         "geometryType": "esriGeometryPoint",
         "inSR": 4326,
         "spatialRel": "esriSpatialRelIntersects",
-        "outFields": out_fields,
+        "outFields": out_fields or "*",
         "returnGeometry": "true",
         "outSR": 4326
     }
-    r = requests.get(layer_url, params=params, timeout=20)
+    r = requests.get(f"{layer_url}/query", params=params, timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"ArcGIS error HTTP {r.status_code}")
     js = r.json()
@@ -107,22 +112,18 @@ def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields:
         msg = js["error"].get("message", "Unknown ArcGIS error")
         raise RuntimeError(f"ArcGIS service error: {msg}")
     feats = js.get("features") or []
-    if not feats:
-        return {}
-    return feats[0]  # first intersecting polygon
+    return feats[0] if feats else {}
 
 def _arcgis_polygon_to_geojson(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Convert ArcGIS polygon geometry (rings) to a GeoJSON-like dict for Folium.
-    Handles simple/multipart by returning a MultiPolygon if multiple rings.
+    For visualisation: treats each ring as exterior (holes ignored).
     """
     if not geom or "rings" not in geom:
         return None
     rings = geom["rings"]
     if not rings:
         return None
-    # Simplistic conversion: treat each ring as its own polygon (holes ignored for display purposes).
-    # This is fine for visualisation; for analytical correctness you'd need ring orientation to attach holes.
     if len(rings) == 1:
         return {"type": "Polygon", "coordinates": [rings[0]]}
     else:
@@ -130,28 +131,25 @@ def _arcgis_polygon_to_geojson(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_nca_feature(lat: float, lon: float) -> Dict[str, Any]:
-    return _arcgis_point_in_polygon(NCA_FEATURESERVER_LAYER, lat, lon, out_fields="JCANAME,NCA_Name")
+    return _arcgis_point_in_polygon(NCA_FEATURESERVER_LAYER, lat, lon, "JCANAME,NCA_Name")
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_lpa_feature(lat: float, lon: float) -> Dict[str, Any]:
-    # Out fields vary by dataset; common LAD fields include LAD23NM (name) and LAD23CD (code).
-    return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, out_fields="*")
+    # ONS 2023 LAD layer commonly uses LAD23NM (name) & LAD23CD (code)
+    return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, "LAD23NM,LAD23CD")
 
 def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
-    attrs = (feat or {}).get("attributes") or {}
-    return attrs.get("NCA_Name") or attrs.get("JCANAME")
+    a = (feat or {}).get("attributes") or {}
+    return a.get("NCA_Name") or a.get("JCANAME")
 
 def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
-    attrs = (feat or {}).get("attributes") or {}
-    # Try likely name fields (newest first)
-    for key in ("LAD23NM", "LAD22NM", "LAD21NM", "LAD20NM", "NAME"):
-        if attrs.get(key):
-            return attrs[key]
-    return None
+    a = (feat or {}).get("attributes") or {}
+    # Prefer current field; fall back if needed
+    return a.get("LAD23NM") or a.get("NAME")
 
-# -----------------------------
-# UI (with wrapped boxes)
-# -----------------------------
+# --------------------------------
+# UI (wrapped boxes + full-width map)
+# --------------------------------
 st.title("🗺️ UK LPA & NCA Lookup")
 st.caption("Enter a **postcode** or a **free-text address**. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.")
 
@@ -244,7 +242,7 @@ if submitted:
         )
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ---------- Map (bottom, full width of the content column) ----------
+        # ---------- Map (bottom, full width) ----------
         # Build GeoJSONs from ArcGIS geometry for Folium
         nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
         lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
@@ -252,7 +250,7 @@ if submitted:
         # Create folium map centered at the point
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
 
-        # Add LPA polygon (thin outline)
+        # Add LPA polygon
         if lpa_geojson:
             folium.GeoJson(
                 lpa_geojson,
@@ -261,7 +259,7 @@ if submitted:
                 tooltip=f"LPA: {lpa_name}"
             ).add_to(fmap)
 
-        # Add NCA polygon (slightly heavier outline)
+        # Add NCA polygon
         if nca_geojson:
             folium.GeoJson(
                 nca_geojson,
@@ -273,35 +271,33 @@ if submitted:
         # Add the point marker
         folium.Marker([lat, lon], tooltip="Location").add_to(fmap)
 
-        # Fit bounds to whatever geometry we have
+        # Fit bounds to polygons (and always include the point)
         bounds = []
-        if lpa_geojson:
-            # collect coords
-            if lpa_geojson["type"] == "Polygon":
-                bounds.extend(lpa_geojson["coordinates"][0])
-            elif lpa_geojson["type"] == "MultiPolygon":
-                for part in lpa_geojson["coordinates"]:
+        def extend_bounds(geojson):
+            nonlocal bounds
+            if not geojson:
+                return
+            if geojson["type"] == "Polygon":
+                bounds.extend(geojson["coordinates"][0])
+            elif geojson["type"] == "MultiPolygon":
+                for part in geojson["coordinates"]:
                     bounds.extend(part[0])
-        if nca_geojson:
-            if nca_geojson["type"] == "Polygon":
-                bounds.extend(nca_geojson["coordinates"][0])
-            elif nca_geojson["type"] == "MultiPolygon":
-                for part in nca_geojson["coordinates"]:
-                    bounds.extend(part[0])
-        # Always include the point
-        bounds.append([lon, lat])  # careful: Folium bounds expect [lat, lon] later
 
-        # Convert bounds to [lat, lon] pairs
+        extend_bounds(lpa_geojson)
+        extend_bounds(nca_geojson)
+        bounds.append([lon, lat])  # ensure the marker is visible
+
+        # Convert to [lat, lon]
         latlon_bounds = [[y, x] for x, y in bounds] if bounds else [[lat, lon], [lat, lon]]
-
         if latlon_bounds:
             fmap.fit_bounds(latlon_bounds, padding=(20, 20))
 
-        st.write(" ")  # small spacer
+        st.write("")  # spacer
         st.markdown("### Map")
-        st_folium(fmap, height=520, returned_objects=[], use_container_width=True)
+        st_folium(fmap, height=540, returned_objects=[], use_container_width=True)
 
     except RuntimeError as e:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
