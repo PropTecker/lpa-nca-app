@@ -7,7 +7,7 @@ from streamlit_folium import st_folium
 import folium
 
 # -------------------------------
-# Page config with logo as icon
+# Page config with logo as favicon
 # -------------------------------
 st.set_page_config(
     page_title="UK LPA & NCA Lookup",
@@ -136,7 +136,6 @@ def get_nca_feature(lat: float, lon: float) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_lpa_feature(lat: float, lon: float) -> Dict[str, Any]:
-    # ONS 2024 LAD layer uses LAD24NM (name) & LAD24CD (code)
     return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, "LAD24NM,LAD24CD")
 
 def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
@@ -150,16 +149,11 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 # --------------------------------
 # Header (centered logo + title + subtitle)
 # --------------------------------
-# Use Streamlit's layout engine to center the logo reliably.
-header_cols = st.columns([1, 2, 1])
-with header_cols[1]:
-    st.image("wild_capital_uk_logo.png", width=160)
-
-# Centered title + subtitle via markdown
 st.markdown(
     """
     <div style="text-align: center;">
-        <h1 style="margin-top: 0.35em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
+        <img src="wild_capital_uk_logo.png" width="180" style="margin-bottom: 0.5em;">
+        <h1 style="margin-top: 0.2em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
         <p style="font-size: 1.1em; color: #555; margin-top: 0;">
             Enter a postcode or a free-text address. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.
         </p>
@@ -236,7 +230,7 @@ if submitted:
         nca_name = get_nca_name_from_feature(nca_feat) or "Not found"
         lpa_name = get_lpa_name_from_feature(lpa_feat) or lpa_text or "Unknown"
 
-        # Results (wrap-friendly)
+        # Results
         st.success("Lookup complete.")
         if notes:
             for n in notes:
@@ -265,13 +259,13 @@ if submitted:
         )
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ---------- Map (bottom, full width) ----------
+        # ---------- Map ----------
         nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
         lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
 
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
 
-        # Add LPA polygon (red outline)
+        # LPA polygon (red outline)
         if lpa_geojson:
             folium.GeoJson(
                 lpa_geojson,
@@ -280,7 +274,7 @@ if submitted:
                 tooltip=f"LPA: {lpa_name}"
             ).add_to(fmap)
 
-        # Add NCA polygon (yellow outline)
+        # NCA polygon (yellow outline)
         if nca_geojson:
             folium.GeoJson(
                 nca_geojson,
@@ -289,7 +283,7 @@ if submitted:
                 tooltip=f"NCA: {nca_name}"
             ).add_to(fmap)
 
-        # Little red dot at the exact point
+        # Red dot marker
         folium.CircleMarker(
             location=[lat, lon],
             radius=5,
@@ -317,7 +311,7 @@ if submitted:
         if latlon_bounds:
             fmap.fit_bounds(latlon_bounds, padding=(20, 20))
 
-        st.write("")  # spacer
+        st.write("")
         st.markdown("### Map")
         st_folium(fmap, height=540, returned_objects=[], use_container_width=True)
 
@@ -325,4 +319,3 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
-
