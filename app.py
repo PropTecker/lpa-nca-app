@@ -7,13 +7,14 @@ from streamlit_folium import st_folium
 import folium
 import base64
 from pathlib import Path
+import math
 
 # -------------------------------
 # Page config with logo as favicon
 # -------------------------------
 st.set_page_config(
     page_title="UK LPA & NCA Lookup",
-    page_icon="wild_capital_uk_logo.png",  # still used for browser tab
+    page_icon="wild_capital_uk_logo.png",
     layout="centered"
 )
 
@@ -26,7 +27,6 @@ def inline_logo_b64(path: str) -> str:
         return ""
     data = p.read_bytes()
     b64 = base64.b64encode(data).decode("utf-8")
-    # adjust MIME type if SVG
     return f"data:image/png;base64,{b64}"
 
 # -------------------------------
@@ -36,17 +36,21 @@ POSTCODES_IO = "https://api.postcodes.io/postcodes/"
 POSTCODES_IO_REVERSE = "https://api.postcodes.io/postcodes"
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 
-# Natural England — National Character Areas
+# Natural England — National Character Areas (polygon layer 0)
 NCA_FEATURESERVER_LAYER = (
     "https://services.arcgis.com/JJzESW51TqeY9uat/arcgis/rest/services/"
     "National_Character_Areas_England/FeatureServer/0"
 )
 
-# ONS — Local Authority Districts (December 2024)
+# ONS — Local Authority Districts (December 2024) Boundaries UK (BFC), polygon layer 0
 LPA_FEATURESERVER_LAYER = (
     "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
     "Local_Authority_Districts_December_2024_Boundaries_UK_BFC/FeatureServer/0"
 )
+
+# EA OGC API – Features (Cycle 3) for Water Catchments
+EA_MGMT_COLL = "https://environment.data.gov.uk/geoservices/datasets/1d8bb4fb-35d0-468f-8de8-a72a25aeec2c/ogc/features/v1/collections/WFD_Surface_Water_Management_Catchments_Cycle_3/items"
+EA_OPER_COLL = "https://environment.data.gov.uk/geoservices/datasets/a547e24c-1852-4edb-ab04-bff12ded803e/ogc/features/v1/collections/WFD_Surface_Water_Operational_Catchments_Cycle_3/items"
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
 
@@ -155,10 +159,78 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
     return a.get("LAD24NM") or a.get("NAME")
 
 # -------------------------------
+# Water catchments (EA OGC API)
+# -------------------------------
+def _ogc_point_cql(lat: float, lon: float) -> str:
+    # OGC API uses lon lat order
+    return f"INTERSECTS(shape,POINT({lon} {lat}))"
+
+def _bbox_around_point(lat: float, lon: float, meters: float = 50.0) -> Tuple[float, float, float, float]:
+    # Approx degrees per meter at given latitude
+    dlat = meters / 111320.0
+    dlon = meters / (40075000.0 * math.cos(math.radians(lat)) / 360.0)
+    return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+
+def _fetch_catchment_feature(collection_url: str, lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """Try CQL2 INTERSECTS first; if unsupported, fall back to small bbox search. Return GeoJSON Feature or None."""
+    # Attempt CQL2
+    try:
+        params = {
+            "f": "application/geo+json",
+            "limit": 5,
+            "filter-lang": "cql2-text",
+            "filter": _ogc_point_cql(lat, lon)
+        }
+        r = requests.get(collection_url, params=params, timeout=20)
+        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("application/geo+json"):
+            gj = r.json()
+            feats = gj.get("features") or []
+            if feats:
+                return feats[0]
+    except Exception:
+        pass
+
+    # Fallback: tiny bbox
+    try:
+        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=100)
+        params = {
+            "f": "application/geo+json",
+            "limit": 10,
+            "bbox": f"{minx},{miny},{maxx},{maxy}"
+        }
+        r = requests.get(collection_url, params=params, timeout=20)
+        if r.status_code == 200:
+            gj = r.json()
+            feats = gj.get("features") or []
+            if feats:
+                # Return first; (optional) could refine by point-in-polygon without shapely
+                return feats[0]
+    except Exception:
+        pass
+
+    return None
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def get_management_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    return _fetch_catchment_feature(EA_MGMT_COLL, lat, lon)
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def get_operational_catchment(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    return _fetch_catchment_feature(EA_OPER_COLL, lat, lon)
+
+def feature_to_simple_geojson(feat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not feat:
+        return None
+    geom = feat.get("geometry")
+    if not geom:
+        return None
+    # Already GeoJSON geometry
+    return geom
+
+# -------------------------------
 # Header with inline logo + title
 # -------------------------------
 logo_src = inline_logo_b64("wild_capital_uk_logo.png")
-
 st.markdown(
     f"""
     <div style="text-align: center;">
@@ -199,6 +271,15 @@ st.markdown("""
 with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
+    # --- Water Catchment drawer ---
+    with st.expander("Optional: Water catchment overlay"):
+        catchment_mode = st.selectbox(
+            "Catchment type",
+            ["None", "Management (Cycle 3)", "Operational (Cycle 3)"],
+            index=0
+        )
+        show_catchment = st.checkbox("Show catchment on the map", value=False)
+        hide_other_layers = st.checkbox("Hide LPA/NCA layers when catchment is shown", value=False)
     submitted = st.form_submit_button("Lookup")
 
 # -------------------------------
@@ -233,10 +314,9 @@ if submitted:
             nearest_pc, lpa_text = get_nearest_postcode_lpa_from_coords(lat, lon)
             shown_pc = nearest_pc
 
-        # Fetch polygons
+        # Fetch base polygons
         nca_feat = get_nca_feature(lat, lon)
         lpa_feat = get_lpa_feature(lat, lon)
-
         nca_name = get_nca_name_from_feature(nca_feat) or "Not found"
         lpa_name = get_lpa_name_from_feature(lpa_feat) or lpa_text or "Unknown"
 
@@ -270,28 +350,58 @@ if submitted:
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ---------- Map ----------
-        nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
-        lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
-
         fmap = folium.Map(location=[lat, lon], zoom_start=11, control_scale=True)
 
+        # Decide which layers to show
+        show_lpa_nca = not (show_catchment and hide_other_layers)
+
         # LPA polygon (red outline)
-        if lpa_geojson:
-            folium.GeoJson(
-                lpa_geojson,
-                name=f"LPA: {lpa_name}",
-                style_function=lambda x: {"color": "red", "fillOpacity": 0.05, "weight": 2},
-                tooltip=f"LPA: {lpa_name}"
-            ).add_to(fmap)
+        if show_lpa_nca:
+            lpa_geojson = _arcgis_polygon_to_geojson((lpa_feat or {}).get("geometry"))
+            if lpa_geojson:
+                folium.GeoJson(
+                    lpa_geojson,
+                    name=f"LPA: {lpa_name}",
+                    style_function=lambda x: {"color": "red", "fillOpacity": 0.05, "weight": 2},
+                    tooltip=f"LPA: {lpa_name}"
+                ).add_to(fmap)
 
         # NCA polygon (yellow outline)
-        if nca_geojson:
-            folium.GeoJson(
-                nca_geojson,
-                name=f"NCA: {nca_name}",
-                style_function=lambda x: {"color": "yellow", "fillOpacity": 0.05, "weight": 3},
-                tooltip=f"NCA: {nca_name}"
-            ).add_to(fmap)
+        if show_lpa_nca:
+            nca_geojson = _arcgis_polygon_to_geojson((nca_feat or {}).get("geometry"))
+            if nca_geojson:
+                folium.GeoJson(
+                    nca_geojson,
+                    name=f"NCA: {nca_name}",
+                    style_function=lambda x: {"color": "yellow", "fillOpacity": 0.05, "weight": 3},
+                    tooltip=f"NCA: {nca_name}"
+                ).add_to(fmap)
+
+        # Catchment overlay (blue outline)
+        bounds = []
+        if show_catchment and catchment_mode != "None":
+            if catchment_mode.startswith("Management"):
+                c_feat = get_management_catchment(lat, lon)
+            else:
+                c_feat = get_operational_catchment(lat, lon)
+
+            if c_feat:
+                c_geom = feature_to_simple_geojson(c_feat)
+                props = c_feat.get("properties", {})
+                cname = props.get("management_catchment") or props.get("oper_catchment") or props.get("name") or "Catchment"
+                if c_geom:
+                    folium.GeoJson(
+                        c_geom,
+                        name=f"Catchment: {cname}",
+                        style_function=lambda x: {"color": "blue", "fillOpacity": 0.04, "weight": 3},
+                        tooltip=f"Catchment: {cname}"
+                    ).add_to(fmap)
+                    # extend bounds with catchment
+                    if c_geom["type"] == "Polygon":
+                        bounds.extend(c_geom["coordinates"][0])
+                    elif c_geom["type"] == "MultiPolygon":
+                        for part in c_geom["coordinates"]:
+                            bounds.extend(part[0])
 
         # Red dot marker
         folium.CircleMarker(
@@ -303,19 +413,26 @@ if submitted:
             tooltip="Location"
         ).add_to(fmap)
 
-        # Fit bounds
-        bounds = []
-        def extend_bounds(geojson, bounds_list):
+        # Fit bounds (consider polygons we added + point)
+        def extend_bounds_from_arcgis_geom(geojson, _bounds):
             if not geojson:
                 return
             if geojson["type"] == "Polygon":
-                bounds_list.extend(geojson["coordinates"][0])
+                _bounds.extend(geojson["coordinates"][0])
             elif geojson["type"] == "MultiPolygon":
                 for part in geojson["coordinates"]:
-                    bounds_list.extend(part[0])
+                    _bounds.extend(part[0])
 
-        extend_bounds(lpa_geojson, bounds)
-        extend_bounds(nca_geojson, bounds)
+        if show_lpa_nca:
+            # add LPA/NCA to bounds if present
+            try:
+                if 'lpa_geojson' in locals() and lpa_geojson:
+                    extend_bounds_from_arcgis_geom(lpa_geojson, bounds)
+                if 'nca_geojson' in locals() and nca_geojson:
+                    extend_bounds_from_arcgis_geom(nca_geojson, bounds)
+            except Exception:
+                pass
+
         bounds.append([lon, lat])
         latlon_bounds = [[y, x] for x, y in bounds] if bounds else [[lat, lon], [lat, lon]]
         if latlon_bounds:
@@ -323,10 +440,11 @@ if submitted:
 
         st.write("")
         st.markdown("### Map")
-        st_folium(fmap, height=540, returned_objects=[], use_container_width=True)
+        st_folium(fmap, height=560, returned_objects=[], use_container_width=True)
 
     except RuntimeError as e:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
