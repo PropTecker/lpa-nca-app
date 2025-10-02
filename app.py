@@ -266,7 +266,11 @@ if submitted:
             folium.GeoJson(
                 lpa_geojson,
                 name=f"LPA: {lpa_name}",
-                style_function=lambda x: {"fillOpacity": 0.05, "weight": 2},
+                style_function=lambda x: {
+                    "color": "red",        # outline colour
+                    "fillOpacity": 0.05,
+                    "weight": 2
+                },
                 tooltip=f"LPA: {lpa_name}"
             ).add_to(fmap)
 
@@ -275,7 +279,11 @@ if submitted:
             folium.GeoJson(
                 nca_geojson,
                 name=f"NCA: {nca_name}",
-                style_function=lambda x: {"fillOpacity": 0.05, "weight": 3},
+                style_function=lambda x: {
+                    "color": "yellow",     # outline colour
+                    "fillOpacity": 0.05,
+                    "weight": 3
+                },
                 tooltip=f"NCA: {nca_name}"
             ).add_to(fmap)
 
