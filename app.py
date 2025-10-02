@@ -136,6 +136,7 @@ def get_nca_feature(lat: float, lon: float) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_lpa_feature(lat: float, lon: float) -> Dict[str, Any]:
+    # ONS 2024 LAD layer uses LAD24NM (name) & LAD24CD (code)
     return _arcgis_point_in_polygon(LPA_FEATURESERVER_LAYER, lat, lon, "LAD24NM,LAD24CD")
 
 def get_nca_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
@@ -149,12 +150,17 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 # --------------------------------
 # Header (centered logo + title + subtitle)
 # --------------------------------
+# Use Streamlit's layout engine to center the logo reliably.
+header_cols = st.columns([1, 2, 1])
+with header_cols[1]:
+    st.image("wild_capital_uk_logo.png", width=160)
+
+# Centered title + subtitle via markdown
 st.markdown(
     """
     <div style="text-align: center;">
-        <img src="wild_capital_uk_logo.png" width="120">
-        <h1 style="margin-top: 0.5em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
-        <p style="font-size: 1.1em; color: #555;">
+        <h1 style="margin-top: 0.35em; margin-bottom: 0.25em;">UK LPA & NCA Lookup</h1>
+        <p style="font-size: 1.1em; color: #555; margin-top: 0;">
             Enter a postcode or a free-text address. We’ll find the Local Planning Authority and National Character Area, and draw their boundaries.
         </p>
     </div>
@@ -283,8 +289,15 @@ if submitted:
                 tooltip=f"NCA: {nca_name}"
             ).add_to(fmap)
 
-        # Add point marker
-        folium.Marker([lat, lon], tooltip="Location").add_to(fmap)
+        # Little red dot at the exact point
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=5,
+            color="red",
+            fill=True,
+            fill_opacity=1.0,
+            tooltip="Location"
+        ).add_to(fmap)
 
         # Fit bounds
         bounds = []
@@ -312,6 +325,4 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
-
-
 
