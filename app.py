@@ -322,7 +322,7 @@ with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
 
-    with st.expander("Optional: Catchment overlays"):
+    with st.expander("Optional: Water body catchment overlays"):
         show_wb = st.checkbox("Show WFD **Water body catchment** (Cycle 3)", value=False)
         show_oper = st.checkbox("Show WFD **Operational catchment** (Cycle 3)", value=False)
         hide_other_layers = st.checkbox("Hide LPA/NCA when catchments are shown", value=False)
