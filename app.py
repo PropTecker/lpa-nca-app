@@ -273,24 +273,25 @@ if submitted:
 
         # Fit bounds to polygons (and always include the point)
         bounds = []
-        def extend_bounds(geojson):
-            nonlocal bounds
+
+        def extend_bounds(geojson, bounds_list):
             if not geojson:
                 return
             if geojson["type"] == "Polygon":
-                bounds.extend(geojson["coordinates"][0])
+                bounds_list.extend(geojson["coordinates"][0])
             elif geojson["type"] == "MultiPolygon":
                 for part in geojson["coordinates"]:
-                    bounds.extend(part[0])
+                    bounds_list.extend(part[0])
 
-        extend_bounds(lpa_geojson)
-        extend_bounds(nca_geojson)
+        extend_bounds(lpa_geojson, bounds)
+        extend_bounds(nca_geojson, bounds)
         bounds.append([lon, lat])  # ensure the marker is visible
 
         # Convert to [lat, lon]
         latlon_bounds = [[y, x] for x, y in bounds] if bounds else [[lat, lon], [lat, lon]]
         if latlon_bounds:
             fmap.fit_bounds(latlon_bounds, padding=(20, 20))
+
 
         st.write("")  # spacer
         st.markdown("### Map")
