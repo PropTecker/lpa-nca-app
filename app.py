@@ -315,7 +315,7 @@ with st.form("lookup_form", clear_on_submit=False):
     address_in = st.text_input("Address (if no postcode)", value="")
 
     # NOTE: Streamlit expander labels sanitize HTML; use emoji badge here.
-    with st.expander("💧 Optional: Water body catchment overlays  🆕 NEW", expanded=False):
+    with st.expander("NEW: Water body catchment overlays", expanded=False):
         # Water body catchment (NEW)
         c1, c2 = st.columns([0.08, 0.92])
         with c1:
