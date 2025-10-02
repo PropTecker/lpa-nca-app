@@ -49,15 +49,17 @@ LPA_FEATURESERVER_LAYER = (
 )
 
 # EA OGC API – Features (LATEST, full coverage)
-EA_WB_CATCHMENTS_COLL = (
-    "https://environment.data.gov.uk/geoservices/datasets/"
-    "cd84a955-fd0a-4f5d-9bcb-b869c8906f9e/ogc/features/v1/"
-    "collections/WFD_River_Water_Body_Catchments_Cycle_3_Classification_2022/items"
-)
+# Operational Catchments (Cycle 3)
 EA_OPER_COLL = (
     "https://environment.data.gov.uk/geoservices/datasets/"
     "a547e24c-1852-4edb-ab04-bff12ded803e/ogc/features/v1/"
     "collections/WFD_Surface_Water_Operational_Catchments_Cycle_3/items"
+)
+# River Water Body Catchments (Cycle 3, full resolution)
+EA_WB_CATCHMENTS_COLL = (
+    "https://environment.data.gov.uk/geoservices/datasets/"
+    "cd84a955-fd0a-4f5d-9bcb-b869c8906f9e/ogc/features/v1/"
+    "collections/WFD_River_Water_Body_Catchments_Cycle_3_Classification_2022/items"
 )
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
@@ -109,7 +111,7 @@ def geojson_contains_point(geom: Dict[str, Any], lon: float, lat: float) -> bool
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
     pc = postcode.replace(" ", "").upper()
-    r = requests.get(POSTCODES_IO + pc, timeout=10)
+    r = requests.get(POSTCODES_IO + pc, timeout=12)
     if r.status_code != 200:
         try:
             err = r.json().get("error", "")
@@ -143,7 +145,7 @@ def geocode_address_nominatim(address: str) -> Tuple[float, float]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Optional[str], str]:
     params = {"lon": lon, "lat": lat, "limit": 1}
-    r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=10)
+    r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=12)
     js = r.json()
     results = js.get("result") or []
     if not results:
@@ -202,7 +204,7 @@ def _ogc_point_cql(lat: float, lon: float) -> str:
     # lon lat order
     return f"INTERSECTS(shape,POINT({lon} {lat}))"
 
-def _bbox_around_point(lat: float, lon: float, meters: float = 300.0) -> Tuple[float, float, float, float]:
+def _bbox_around_point(lat: float, lon: float, meters: float = 400.0) -> Tuple[float, float, float, float]:
     dlat = meters / 111320.0
     dlon = meters / (40075000.0 * math.cos(math.radians(lat)) / 360.0)
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
@@ -211,16 +213,17 @@ def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float)
     """
     Query EA OGC collection for features that intersect the point,
     then return the one that truly CONTAINS (lon,lat) using strict PIP.
+    Includes small-bbox fallback to handle intermittent provider filtering quirks.
     """
-    # Try CQL2 INTERSECTS first (request GeoJSON, WGS84)
+    # Try CQL2 INTERSECTS first
     try:
         params = {
             "f": "application/geo+json",
-            "limit": 50,
+            "limit": 100,
             "filter-lang": "cql2-text",
             "filter": _ogc_point_cql(lat, lon)
         }
-        r = requests.get(collection_url, params=params, timeout=20)
+        r = requests.get(collection_url, params=params, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
             gj = r.json()
             for feat in gj.get("features") or []:
@@ -230,15 +233,15 @@ def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float)
     except Exception:
         pass
 
-    # Fallback: small bbox
+    # Fallback: small bbox around the point
     try:
-        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=400)
+        minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=600)
         params = {
             "f": "application/geo+json",
-            "limit": 100,
+            "limit": 200,
             "bbox": f"{minx},{miny},{maxx},{maxy}"
         }
-        r = requests.get(collection_url, params=params, timeout=20)
+        r = requests.get(collection_url, params=params, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
             gj = r.json()
             for feat in gj.get("features") or []:
@@ -315,7 +318,7 @@ with st.form("lookup_form", clear_on_submit=False):
     address_in = st.text_input("Address (if no postcode)", value="")
 
     # NOTE: Streamlit expander labels sanitize HTML; use emoji badge here.
-    with st.expander("NEW: Water body catchment overlays", expanded=False):
+    with st.expander("💧 Optional: Water body catchment overlays  🆕 NEW", expanded=False):
         # Water body catchment (NEW)
         c1, c2 = st.columns([0.08, 0.92])
         with c1:
@@ -438,7 +441,7 @@ if submitted:
                     tooltip=f"NCA: {nca_name}"
                 ).add_to(fmap)
 
-        bounds = []
+        bounds: List[List[float]] = []
 
         # Water body catchment (blue) — FULL dataset
         if show_wb:
@@ -446,7 +449,10 @@ if submitted:
             if wb_feat:
                 wb_geom = wb_feat.get("geometry")
                 if wb_geom and geojson_contains_point(wb_geom, lon, lat):
-                    wb_name = wb_feat.get("properties", {}).get("water_body_name") or "Water body catchment"
+                    props = wb_feat.get("properties", {})
+                    wb_name = (props.get("water_body_name")
+                               or props.get("name")
+                               or "Water body catchment")
                     folium.GeoJson(
                         wb_geom,
                         name=f"WFD water body: {wb_name}",
@@ -466,7 +472,9 @@ if submitted:
                 oc_geom = oc_feat.get("geometry")
                 if oc_geom and geojson_contains_point(oc_geom, lon, lat):
                     props = oc_feat.get("properties", {})
-                    oc_name = props.get("operational_catchment") or props.get("name") or "Operational catchment"
+                    oc_name = (props.get("operational_catchment")
+                               or props.get("name")
+                               or "Operational catchment")
                     folium.GeoJson(
                         oc_geom,
                         name=f"Operational catchment: {oc_name}",
@@ -518,6 +526,7 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
 
