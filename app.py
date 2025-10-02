@@ -323,9 +323,51 @@ with st.form("lookup_form", clear_on_submit=False):
     address_in = st.text_input("Address (if no postcode)", value="")
 
     with st.expander("Optional: Water body catchment overlays"):
-        show_wb = st.checkbox("Show WFD **Water body catchment** (Cycle 3)", value=False)
-        show_oper = st.checkbox("Show WFD **Operational catchment** (Cycle 3)", value=False)
-        hide_other_layers = st.checkbox("Hide LPA/NCA when catchments are shown", value=False)
+        # Tiny CSS badge for NEW
+        st.markdown("""
+        <style>
+          .badge-new {
+            display: inline-block;
+            color: #fff;
+            background: #d11;
+            border-radius: 6px;
+            padding: 1px 6px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            margin-left: 6px;
+          }
+          .opt-label {
+            font-size: 0.95rem;
+            line-height: 1.2;
+          }
+        </style>
+        """, unsafe_allow_html=True)
+    
+        # Water body catchment (NEW)
+        c1, c2 = st.columns([0.08, 0.92])
+        with c1:
+            show_wb = st.checkbox("", value=False, key="wb_new", label_visibility="collapsed")
+        with c2:
+            st.markdown(
+                '### <span class="opt-label">Show WFD <strong>Water body catchment</strong> (Cycle 3)</span>'
+                ' <span class="badge-new">NEW</span>',
+                unsafe_allow_html=True
+            )
+    
+        # Operational catchment (NEW)
+        c3, c4 = st.columns([0.08, 0.92])
+        with c3:
+            show_oper = st.checkbox("", value=False, key="oper_new", label_visibility="collapsed")
+        with c4:
+            st.markdown(
+                '### <span class="opt-label">Show WFD <strong>Operational catchment</strong> (Cycle 3)</span>'
+                ' <span class="badge-new">NEW</span>',
+                unsafe_allow_html=True
+            )
+    
+        # Existing option (not new)
+        hide_other_layers = st.checkbox("Hide LPA/NCA when catchments are shown", value=False, key="hide_layers")
+
 
     submitted = st.form_submit_button("Lookup")
 
