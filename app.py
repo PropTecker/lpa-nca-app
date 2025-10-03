@@ -1,25 +1,27 @@
 import json
 import re
-import requests
-import streamlit as st
-from typing import Optional, Tuple, Dict, Any, List
-from streamlit_folium import st_folium
-import folium
+import time
+import math
 import base64
 from pathlib import Path
-import math
+from typing import Optional, Tuple, Dict, Any, List
+
+import requests
+import streamlit as st
+from streamlit_folium import st_folium
+import folium
 
 # -------------------------------
 # Page config with logo as favicon
 # -------------------------------
 st.set_page_config(
     page_title="UK LPA & NCA Lookup",
-    page_icon="wild_capital_uk_logo.png",
+    page_icon="wild_capital_uk_logo.png",  # ensure this file exists in the repo root
     layout="centered"
 )
 
 # -------------------------------
-# Helper: embed logo inline (base64)
+# Helper: embed logo inline (base64) for centered header
 # -------------------------------
 def inline_logo_b64(path: str) -> str:
     p = Path(path)
@@ -60,11 +62,11 @@ EA_WB_CATCHMENTS_COLL = (
     "collections/WFD_River_Water_Body_Catchments_Cycle_3_Classification_2022/items"
 )
 
-# CRS forms that different servers accept
+# CRS permutations some servers accept
 CRS_FORMS = [
-    "http://www.opengis.net/def/crs/OGC/1.3/CRS84",         # CRS:84 (lon/lat)
-    "EPSG:4326",                                            # short
-    "http://www.opengis.net/def/crs/EPSG/0/4326",           # full URI
+    "http://www.opengis.net/def/crs/OGC/1.3/CRS84",  # lon/lat WGS84
+    "EPSG:4326",                                     # short
+    "http://www.opengis.net/def/crs/EPSG/0/4326",    # full URI
 ]
 
 POSTCODE_RX = re.compile(r"^(GIR\s?0AA|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})$", flags=re.IGNORECASE)
@@ -76,6 +78,7 @@ def looks_like_uk_postcode(s: str) -> bool:
 # Geo helpers: strict point-in-polygon for GeoJSON (lon,lat)
 # -------------------------------
 def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
+    """Ray casting for a linear ring (lon/lat). Edge-inclusive."""
     inside = False
     n = len(ring)
     if n < 3:
@@ -83,16 +86,19 @@ def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
     for i in range(n):
         x1, y1 = ring[i]
         x2, y2 = ring[(i + 1) % n]
+        # Toggle crossings
         if ((y1 > lat) != (y2 > lat)) and (lon < (x2 - x1) * (lat - y1) / (y2 - y1 + 1e-18) + x1):
             inside = not inside
-        # Edge-inclusive
+        # Edge-inclusive: colinear & within segment bbox
         if (min(x1, x2) - 1e-12 <= lon <= max(x1, x2) + 1e-12 and
             min(y1, y2) - 1e-12 <= lat <= max(y1, y2) + 1e-12):
+            # cross product ~ 0
             if abs((y2 - y1) * (lon - x1) - (x2 - x1) * (lat - y1)) <= 1e-12:
                 return True
     return inside
 
 def geojson_contains_point(geom: Dict[str, Any], lon: float, lat: float) -> bool:
+    """True if (lon,lat) inside Polygon/MultiPolygon (holes respected)."""
     if not geom or "type" not in geom:
         return False
     if geom["type"] == "Polygon":
@@ -111,7 +117,70 @@ def geojson_contains_point(geom: Dict[str, Any], lon: float, lat: float) -> bool
     return False
 
 # -------------------------------
-# Cached API wrappers
+# Robust HTTP helper
+# -------------------------------
+def _http_get_with_retries(url: str, params: dict, headers: dict, timeout: int = 15,
+                           tries: int = 4, backoff: float = 0.75):
+    """Simple GET with exponential backoff. Retries on network errors and 429/5xx."""
+    last_err = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if r.status_code >= 500 or r.status_code == 429:
+                raise requests.RequestException(f"HTTP {r.status_code}")
+            return r
+        except requests.RequestException as e:
+            last_err = e
+            if i < tries - 1:
+                time.sleep(backoff * (2 ** i))
+            else:
+                raise last_err
+
+# -------------------------------
+# Geocoding: Nominatim with retries, Photon fallback
+# -------------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def geocode_address(address: str) -> Tuple[float, float]:
+    """
+    Robust geocoder: try Nominatim (with retries), then Photon as fallback.
+    Returns (lat, lon) floats.
+    """
+    # 1) Nominatim
+    nom_params = {"q": address, "format": "jsonv2", "limit": 1, "addressdetails": 0}
+    nom_headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (+contact@wildcapital.example)"}  # set org email
+    try:
+        r = _http_get_with_retries(NOMINATIM_SEARCH, params=nom_params, headers=nom_headers, timeout=15)
+        if r.status_code == 200:
+            js = r.json()
+            if js:
+                lat = js[0].get("lat")
+                lon = js[0].get("lon")
+                if lat is not None and lon is not None:
+                    return float(lat), float(lon)
+    except Exception:
+        pass  # fall through to Photon
+
+    # 2) Photon (GeoJSON; coords are [lon,lat])
+    pho_params = {"q": address, "limit": 1}
+    pho_headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (+contact@wildcapital.example)"}
+    try:
+        r = _http_get_with_retries("https://photon.komoot.io/api/", params=pho_params,
+                                   headers=pho_headers, timeout=15)
+        if r.status_code == 200:
+            js = r.json()
+            feats = (js or {}).get("features") or []
+            if feats:
+                coords = feats[0].get("geometry", {}).get("coordinates")
+                if coords and len(coords) == 2:
+                    lon, lat = float(coords[0]), float(coords[1])
+                    return lat, lon
+    except Exception:
+        pass
+
+    raise RuntimeError("Address geocoding is temporarily unavailable. Please try again, or use a postcode.")
+
+# -------------------------------
+# Postcodes.io: forward + reverse
 # -------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
@@ -132,22 +201,6 @@ def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
     return float(lat), float(lon), lpa, data.get("postcode", pc)
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def geocode_address_nominatim(address: str) -> Tuple[float, float]:
-    params = {"q": address, "format": "jsonv2", "limit": 1, "addressdetails": 0}
-    headers = {"User-Agent": "WildCapital-LPA-NCA/1.0"}
-    r = requests.get(NOMINATIM_SEARCH, params=params, headers=headers, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"Nominatim error HTTP {r.status_code}")
-    js = r.json()
-    if not js:
-        raise RuntimeError("No geocoding result for that address.")
-    lat = js[0].get("lat")
-    lon = js[0].get("lon")
-    if lat is None or lon is None:
-        raise RuntimeError("Geocoder did not return coordinates.")
-    return float(lat), float(lon)
-
-@st.cache_data(show_spinner=False, ttl=3600)
 def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Optional[str], str]:
     params = {"lon": lon, "lat": lat, "limit": 1}
     r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=12)
@@ -159,6 +212,9 @@ def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Option
     lpa = res.get("admin_district") or res.get("admin_county") or res.get("parish") or "Unknown"
     return res.get("postcode"), lpa
 
+# -------------------------------
+# ArcGIS FeatureServer helpers (NCA/LPA)
+# -------------------------------
 def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields: str) -> Dict[str, Any]:
     geometry_dict = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
     params = {
@@ -207,7 +263,6 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 # -------------------------------
 def _ogc_point_cql(lon: float, lat: float, srid_qualified: bool = False) -> str:
     if srid_qualified:
-        # SRID-qualified WKT (some servers need this form)
         return f"INTERSECTS(shape,SRID=4326;POINT({lon} {lat}))"
     return f"INTERSECTS(shape,POINT({lon} {lat}))"
 
@@ -217,10 +272,7 @@ def _bbox_around_point(lat: float, lon: float, meters: float = 600.0) -> Tuple[f
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
 def _try_ogc_cql(collection_url: str, lon: float, lat: float) -> Optional[Dict[str, Any]]:
-    """
-    Try several CRS permutations and geometry literals for CQL2 INTERSECTS.
-    Return the first feature whose geometry truly contains (lon,lat).
-    """
+    """Try several CRS permutations and geometry literals for CQL2 INTERSECTS."""
     for crs in CRS_FORMS:
         for srid_geom in (False, True):
             try:
@@ -240,7 +292,7 @@ def _try_ogc_cql(collection_url: str, lon: float, lat: float) -> Optional[Dict[s
                             return feat
             except Exception:
                 pass
-    # final attempt: no filter-crs but SRID-qualified geometry in filter
+    # final attempt: SRID-qualified geometry without filter-crs
     try:
         params = {
             "f": "application/geo+json",
@@ -278,7 +330,7 @@ def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[
                         return feat
         except Exception:
             pass
-    # last resort: bbox without bbox-crs header
+    # last resort: bbox without bbox-crs
     try:
         params = {
             "f": "application/geo+json",
@@ -297,8 +349,7 @@ def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[
     return None
 
 def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    # IMPORTANT: OGC uses lon/lat order
-    lon_, lat_ = float(lon), float(lat)
+    lon_, lat_ = float(lon), float(lat)  # OGC uses lon,lat order
     feat = _try_ogc_cql(collection_url, lon_, lat_)
     if feat:
         return feat
@@ -371,7 +422,7 @@ with st.form("lookup_form", clear_on_submit=False):
     postcode_in = st.text_input("Postcode (leave blank to use address)", value="")
     address_in = st.text_input("Address (if no postcode)", value="")
 
-    # Expander labels sanitize HTML; use emoji badge here.
+    # NOTE: Expander labels sanitize HTML; use emoji badge here.
     with st.expander("💧 Optional: Water body catchment overlays  🆕 NEW", expanded=False):
         # Water body catchment (NEW)
         c1, c2 = st.columns([0.08, 0.92])
@@ -416,19 +467,19 @@ if submitted:
             except RuntimeError as e:
                 if looks_like_uk_postcode(postcode_in):
                     notes.append(f"Note: Postcode lookup failed ({e}). Falling back to address geocoding.")
-                    lat, lon = geocode_address_nominatim(postcode_in.strip())
+                    lat, lon = geocode_address(postcode_in.strip())
                     nearest_pc, lpa_text = get_nearest_postcode_lpa_from_coords(lat, lon)
                     shown_pc = nearest_pc
                 else:
                     notes.append("Input didn’t validate as a UK postcode. Using address geocoding.")
-                    lat, lon = geocode_address_nominatim(postcode_in.strip())
+                    lat, lon = geocode_address(postcode_in.strip())
                     nearest_pc, lpa_text = get_nearest_postcode_lpa_from_coords(lat, lon)
                     shown_pc = nearest_pc
         else:
             if not address_in.strip():
                 st.warning("Please enter either a postcode or an address.")
                 st.stop()
-            lat, lon = geocode_address_nominatim(address_in.strip())
+            lat, lon = geocode_address(address_in.strip())
             nearest_pc, lpa_text = get_nearest_postcode_lpa_from_coords(lat, lon)
             shown_pc = nearest_pc
 
@@ -576,6 +627,7 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
 
