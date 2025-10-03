@@ -92,7 +92,6 @@ def _point_in_ring(lon: float, lat: float, ring: List[List[float]]) -> bool:
         # Edge-inclusive: colinear & within segment bbox
         if (min(x1, x2) - 1e-12 <= lon <= max(x1, x2) + 1e-12 and
             min(y1, y2) - 1e-12 <= lat <= max(y1, y2) + 1e-12):
-            # cross product ~ 0
             if abs((y2 - y1) * (lon - x1) - (x2 - x1) * (lat - y1)) <= 1e-12:
                 return True
     return inside
@@ -139,6 +138,8 @@ def _http_get_with_retries(url: str, params: dict, headers: dict, timeout: int =
 # -------------------------------
 # Geocoding: Nominatim with retries, Photon fallback
 # -------------------------------
+UA = {"User-Agent": "WildCapital-LPA-NCA/1.0 (+contact@wildcapital.example)"}  # TODO: set a real contact email
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def geocode_address(address: str) -> Tuple[float, float]:
     """
@@ -147,9 +148,8 @@ def geocode_address(address: str) -> Tuple[float, float]:
     """
     # 1) Nominatim
     nom_params = {"q": address, "format": "jsonv2", "limit": 1, "addressdetails": 0}
-    nom_headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (+contact@wildcapital.example)"}  # set org email
     try:
-        r = _http_get_with_retries(NOMINATIM_SEARCH, params=nom_params, headers=nom_headers, timeout=15)
+        r = _http_get_with_retries(NOMINATIM_SEARCH, params=nom_params, headers=UA, timeout=15)
         if r.status_code == 200:
             js = r.json()
             if js:
@@ -162,10 +162,9 @@ def geocode_address(address: str) -> Tuple[float, float]:
 
     # 2) Photon (GeoJSON; coords are [lon,lat])
     pho_params = {"q": address, "limit": 1}
-    pho_headers = {"User-Agent": "WildCapital-LPA-NCA/1.0 (+contact@wildcapital.example)"}
     try:
         r = _http_get_with_retries("https://photon.komoot.io/api/", params=pho_params,
-                                   headers=pho_headers, timeout=15)
+                                   headers=UA, timeout=15)
         if r.status_code == 200:
             js = r.json()
             feats = (js or {}).get("features") or []
@@ -185,7 +184,7 @@ def geocode_address(address: str) -> Tuple[float, float]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
     pc = postcode.replace(" ", "").upper()
-    r = requests.get(POSTCODES_IO + pc, timeout=12)
+    r = requests.get(POSTCODES_IO + pc, timeout=12, headers=UA)
     if r.status_code != 200:
         try:
             err = r.json().get("error", "")
@@ -203,7 +202,7 @@ def get_postcode_info(postcode: str) -> Tuple[float, float, str, str]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_nearest_postcode_lpa_from_coords(lat: float, lon: float) -> Tuple[Optional[str], str]:
     params = {"lon": lon, "lat": lat, "limit": 1}
-    r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=12)
+    r = requests.get(POSTCODES_IO_REVERSE, params=params, timeout=12, headers=UA)
     js = r.json()
     results = js.get("result") or []
     if not results:
@@ -228,7 +227,7 @@ def _arcgis_point_in_polygon(layer_url: str, lat: float, lon: float, out_fields:
         "returnGeometry": "true",
         "outSR": 4326
     }
-    r = requests.get(f"{layer_url}/query", params=params, timeout=20)
+    r = requests.get(f"{layer_url}/query", params=params, timeout=20, headers=UA)
     js = r.json()
     feats = js.get("features") or []
     return feats[0] if feats else {}
@@ -261,10 +260,15 @@ def get_lpa_name_from_feature(feat: Dict[str, Any]) -> Optional[str]:
 # -------------------------------
 # OGC helpers (multi-CRS, robust)
 # -------------------------------
-def _ogc_point_cql(lon: float, lat: float, srid_qualified: bool = False) -> str:
+def _ogc_point_cql(lon: float, lat: float, srid_qualified: bool = False, geom_col: str = "geometry") -> str:
+    """
+    Build a CQL2 INTERSECTS filter using the given geometry column name.
+    Many OGC servers expose the geometry property as 'geometry' (default),
+    some as 'geom', and a few as 'shape'.
+    """
     if srid_qualified:
-        return f"INTERSECTS(shape,SRID=4326;POINT({lon} {lat}))"
-    return f"INTERSECTS(shape,POINT({lon} {lat}))"
+        return f"INTERSECTS({geom_col},SRID=4326;POINT({lon} {lat}))"
+    return f"INTERSECTS({geom_col},POINT({lon} {lat}))"
 
 def _bbox_around_point(lat: float, lon: float, meters: float = 600.0) -> Tuple[float, float, float, float]:
     dlat = meters / 111320.0
@@ -272,47 +276,58 @@ def _bbox_around_point(lat: float, lon: float, meters: float = 600.0) -> Tuple[f
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
 def _try_ogc_cql(collection_url: str, lon: float, lat: float) -> Optional[Dict[str, Any]]:
-    """Try several CRS permutations and geometry literals for CQL2 INTERSECTS."""
+    """
+    Try several CRS permutations AND several possible geometry property names.
+    """
+    geom_cols = ["geometry", "geom", "shape"]  # order matters: most servers use 'geometry'
     for crs in CRS_FORMS:
         for srid_geom in (False, True):
-            try:
-                params = {
-                    "f": "application/geo+json",
-                    "limit": 100,
-                    "filter-lang": "cql2-text",
-                    "filter": _ogc_point_cql(lon, lat, srid_qualified=srid_geom),
-                    "filter-crs": crs
-                }
-                r = requests.get(collection_url, params=params, timeout=25)
-                if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
-                    gj = r.json()
-                    for feat in gj.get("features") or []:
-                        geom = feat.get("geometry")
-                        if geom and geojson_contains_point(geom, lon, lat):
-                            return feat
-            except Exception:
-                pass
-    # final attempt: SRID-qualified geometry without filter-crs
-    try:
-        params = {
-            "f": "application/geo+json",
-            "limit": 100,
-            "filter-lang": "cql2-text",
-            "filter": _ogc_point_cql(lon, lat, srid_qualified=True),
-        }
-        r = requests.get(collection_url, params=params, timeout=25)
-        if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
-            gj = r.json()
-            for feat in gj.get("features") or []:
-                geom = feat.get("geometry")
-                if geom and geojson_contains_point(geom, lon, lat):
-                    return feat
-    except Exception:
-        pass
+            for gcol in geom_cols:
+                try:
+                    params = {
+                        "f": "application/geo+json",
+                        "limit": 100,
+                        "filter-lang": "cql2-text",
+                        "filter": _ogc_point_cql(lon, lat, srid_qualified=srid_geom, geom_col=gcol),
+                        "filter-crs": crs
+                    }
+                    r = requests.get(collection_url, params=params, headers=UA, timeout=25)
+                    if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
+                        gj = r.json()
+                        for feat in gj.get("features") or []:
+                            geom = feat.get("geometry")
+                            if geom and geojson_contains_point(geom, lon, lat):
+                                return feat
+                except Exception:
+                    pass
+
+    # final attempt: SRID-qualified geometry without filter-crs, still cycling geom cols
+    for gcol in ["geometry", "geom", "shape"]:
+        try:
+            params = {
+                "f": "application/geo+json",
+                "limit": 100,
+                "filter-lang": "cql2-text",
+                "filter": _ogc_point_cql(lon, lat, srid_qualified=True, geom_col=gcol),
+            }
+            r = requests.get(collection_url, params=params, headers=UA, timeout=25)
+            if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
+                gj = r.json()
+                for feat in gj.get("features") or []:
+                    geom = feat.get("geometry")
+                    if geom and geojson_contains_point(geom, lon, lat):
+                        return feat
+        except Exception:
+            pass
+
     return None
 
 def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[str, Any]]:
-    minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=1000)
+    """
+    BBOX fallback: compute a small lon/lat box around the point,
+    then verify point-in-polygon client-side.
+    """
+    minx, miny, maxx, maxy = _bbox_around_point(lat, lon, meters=1200)  # slightly larger search window
     for crs in CRS_FORMS:
         try:
             params = {
@@ -321,7 +336,7 @@ def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[
                 "bbox": f"{minx},{miny},{maxx},{maxy}",
                 "bbox-crs": crs
             }
-            r = requests.get(collection_url, params=params, timeout=25)
+            r = requests.get(collection_url, params=params, headers=UA, timeout=25)
             if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
                 gj = r.json()
                 for feat in gj.get("features") or []:
@@ -337,7 +352,7 @@ def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[
             "limit": 200,
             "bbox": f"{minx},{miny},{maxx},{maxy}",
         }
-        r = requests.get(collection_url, params=params, timeout=25)
+        r = requests.get(collection_url, params=params, headers=UA, timeout=25)
         if r.status_code == 200 and "application/geo+json" in r.headers.get("Content-Type", ""):
             gj = r.json()
             for feat in gj.get("features") or []:
@@ -349,11 +364,12 @@ def _try_ogc_bbox(collection_url: str, lon: float, lat: float) -> Optional[Dict[
     return None
 
 def _fetch_feature_containing_point(collection_url: str, lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    lon_, lat_ = float(lon), float(lat)  # OGC uses lon,lat order
-    feat = _try_ogc_cql(collection_url, lon_, lat_)
+    # Use explicit names to avoid order confusion (OGC uses lon,lat in literals)
+    lon_val, lat_val = float(lon), float(lat)
+    feat = _try_ogc_cql(collection_url, lon_val, lat_val)
     if feat:
         return feat
-    feat = _try_ogc_bbox(collection_url, lon_, lat_)
+    feat = _try_ogc_bbox(collection_url, lon_val, lat_val)
     if feat:
         return feat
     return None
@@ -619,6 +635,9 @@ if submitted:
         if latlon_bounds:
             fmap.fit_bounds(latlon_bounds, padding=(20, 20))
 
+        # Layer toggle
+        folium.LayerControl(collapsed=False).add_to(fmap)
+
         st.write("")
         st.markdown("### Map")
         st_folium(fmap, height=560, returned_objects=[], use_container_width=True)
@@ -627,6 +646,7 @@ if submitted:
         st.error(str(e))
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
 
